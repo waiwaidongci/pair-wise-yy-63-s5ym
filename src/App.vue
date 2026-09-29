@@ -16,6 +16,8 @@ import {
 import TokenEditor from './components/TokenEditor.vue';
 import { fetchTokens, submitRelease, type Token } from './api';
 import { useTokenStore } from './store';
+import { describeVerdict } from './merge';
+import { themes, themeLabel } from './themes';
 
 const AddButtonIcon = () => h(AddIcon);
 const ArrowRightButtonIcon = () => h(ArrowRightIcon);
@@ -72,6 +74,25 @@ const graphEdges = computed(() => store.dependencyEdges.map((edge) => {
   const to = graphNodes.value.find((node) => node.id === edge.to);
   return from && to ? { ...edge, from, to } : null;
 }).filter(Boolean) as { from: Token & {x:number;y:number}; to: Token & {x:number;y:number} }[]);
+
+const themeGroups = computed(() => {
+  const groups = new Map<string, { theme: string; items: { id: string; name: string; before: string; after: string }[] }>();
+  store.changes.filter((change) => change.status === '已接受').forEach((change) => {
+    const group = groups.get(change.theme) ?? { theme: change.theme, items: [] };
+    const token = store.tokens.find((item) => item.id === change.diff.token);
+    const base = store.baseline.find((item) => item.id === change.diff.token);
+    const existing = group.items.find((item) => item.id === change.diff.token);
+    if (existing) existing.after = change.diff.after;
+    else group.items.push({
+      id: change.diff.token,
+      name: token?.name ?? change.diff.token,
+      before: base?.themes[change.theme] ?? base?.value ?? change.diff.before,
+      after: change.diff.after
+    });
+    groups.set(change.theme, group);
+  });
+  return [...groups.values()];
+});
 
 const releaseMutation = useMutation({
   mutationFn: (payload: { version: string; accepted: string[]; actor: string }) => submitRelease(payload),
@@ -139,10 +160,33 @@ function batchReplace() {
 }
 
 function publish() {
+  if (store.conflictChanges.length) {
+    MessagePlugin.warning(`还有 ${store.conflictChanges.length} 条冲突提案待人工处理，不能发布`);
+    return;
+  }
   const accepted = store.changes.filter((item) => item.status === '已接受').map((item) => item.id);
   releaseMutation.mutate({ version: selectedVersion.value, accepted, actor: '设计系统维护员' });
+  const snapshot = store.buildSnapshot(selectedVersion.value);
   store.lockRelease();
   releaseDialog.value = true;
+  if (!snapshot.themes.length) MessagePlugin.info('当前没有已接受提案，快照与发布基线一致');
+}
+
+function acceptChange(id: string) {
+  const change = store.changes.find((item) => item.id === id);
+  const verdict = store.acceptChange(id);
+  if (verdict.kind === 'conflict') {
+    MessagePlugin.error(`检测到冲突：${describeVerdict(verdict)}（${verdict.conflictTokens.join('、')}）`);
+    return;
+  }
+  if (verdict.reason === 'already-applied') MessagePlugin.success(describeVerdict(verdict));
+  else if (verdict.notice) MessagePlugin.warning(verdict.notice);
+  else MessagePlugin.success(`已按三方合并接受 ${change?.id ?? ''}，仅更新「${themeLabel(change?.theme ?? '')}」主题`);
+}
+
+function resolveConflict(id: string, choice: 'theirs' | 'ours') {
+  store.resolveConflict(id, choice);
+  MessagePlugin.success(choice === 'theirs' ? '已采用提案取值，冲突关闭' : '已保留当前取值，提案退回');
 }
 </script>
 
@@ -158,13 +202,13 @@ function publish() {
     <t-layout class="body-layout">
       <t-aside class="side-nav">
         <div class="workspace-card"><t-icon name="layers" /><div><span>当前工作区</span><strong>通用组件库 · 品牌主题</strong><small>15 个令牌 · 4 个主题变体</small></div></div>
-        <nav><button v-for="item in nav" :key="item.path" :class="{ active: route.path === item.path }" @click="go(item.path)"><t-icon :name="item.icon" /><span>{{ item.label }}</span><t-badge v-if="item.path === '/review'" :count="store.changes.filter(c => c.status === '待评审').length" /></button></nav>
+        <nav><button v-for="item in nav" :key="item.path" :class="{ active: route.path === item.path }" @click="go(item.path)"><t-icon :name="item.icon" /><span>{{ item.label }}</span><t-badge v-if="item.path === '/review'" :count="store.changes.filter(c => c.status === '待评审' || c.status === '冲突待决').length" /></button></nav>
         <div class="save-state"><t-icon name="cloud-done" /><div><span>草稿已保存</span><small>{{ new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}</small></div></div>
       </t-aside>
       <t-content class="main-content">
         <header class="page-heading">
           <div><small>{{ store.locked ? 'RELEASE LOCKED' : 'GOVERNANCE WORKBENCH' }} / {{ pageTitle }}</small><h1>{{ pageTitle }}</h1><p>基础令牌到语义令牌的引用、差异、校验与跨主题发布。</p></div>
-          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="[{label:'明亮模式',value:'light'},{label:'暗色模式',value:'dark'},{label:'运营模式',value:'ops'},{label:'高对比度',value:'contrast'}]" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" :disabled="store.locked" @click="publish">发布主题</t-button></div>
+          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="themes.map(t => ({ label: t.label, value: t.id }))" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" :disabled="store.locked" @click="publish">发布主题</t-button></div>
         </header>
 
         <section v-if="route.path === '/'" class="token-workspace">
@@ -217,13 +261,26 @@ function publish() {
         </section>
 
         <section v-else-if="route.path === '/review'" class="review-page">
-          <div class="review-summary panel"><div><span>待评审变更</span><strong>{{ store.changes.filter(c => c.status === '待评审').length }}</strong></div><div><span>已接受</span><strong>{{ store.changes.filter(c => c.status === '已接受').length }}</strong></div><div><span>已退回</span><strong>{{ store.changes.filter(c => c.status === '已退回').length }}</strong></div><div><span>受影响组件</span><strong>48</strong></div></div>
+          <div v-if="store.conflictChanges.length" class="conflict-banner panel">
+            <t-icon name="error-circle" size="22px" />
+            <div>
+              <strong>{{ store.conflictChanges.length }} 条提案与当前版本冲突，双方修改均已保留</strong>
+              <span>冲突令牌：{{ store.conflictTokens.join('、') }}。发布前必须逐个人工选择取值，系统不会覆盖任何一方。</span>
+            </div>
+          </div>
+          <div class="review-summary panel"><div><span>待评审变更</span><strong>{{ store.changes.filter(c => c.status === '待评审').length }}</strong></div><div><span>已接受</span><strong>{{ store.changes.filter(c => c.status === '已接受').length }}</strong></div><div><span>冲突待决</span><strong :class="{ bad: store.conflictChanges.length }">{{ store.conflictChanges.length }}</strong></div><div><span>已退回</span><strong>{{ store.changes.filter(c => c.status === '已退回').length }}</strong></div><div><span>受影响组件</span><strong>48</strong></div></div>
           <div class="review-grid">
-            <div v-for="change in store.changes" :key="change.id" class="panel change-card">
-              <div class="change-head"><div><t-tag size="small">{{ change.id }}</t-tag><strong>{{ change.title }}</strong><span>{{ change.requester }} · {{ change.scope }}</span></div><t-tag :theme="change.status === '已接受' ? 'success' : change.status === '已退回' ? 'danger' : 'warning'" variant="light">{{ change.status }}</t-tag></div>
-              <div class="diff-box"><div><span>修改前</span><code>{{ change.diff.before }}</code></div><t-icon name="arrow-right" /><div><span>修改后</span><code>{{ change.diff.after }}</code></div></div>
+            <div v-for="change in store.changes" :key="change.id" class="panel change-card" :class="{ conflict: change.status === '冲突待决' }">
+              <div class="change-head"><div><t-tag size="small">{{ change.id }}</t-tag><strong>{{ change.title }}</strong><span>{{ change.requester }} · {{ change.scope }}</span><span class="baseline-line">基线 {{ change.baseVersion }} · 主题「{{ themeLabel(change.theme) }}」</span></div><t-tag :theme="change.status === '已接受' ? 'success' : change.status === '已退回' ? 'danger' : change.status === '冲突待决' ? 'danger' : 'warning'" variant="light">{{ change.status }}</t-tag></div>
+              <div class="diff-box"><div><span>基线值 · {{ change.baseVersion }}</span><code>{{ change.diff.before }}</code></div><t-icon name="arrow-right" /><div><span>提案目标值</span><code>{{ change.diff.after }}</code></div></div>
+              <div class="current-line"><span>当前「{{ themeLabel(change.theme) }}」实际值</span><code :class="{ drift: change.status === '待评审' && store.currentThemeValueOf(change) !== change.diff.before }">{{ store.currentThemeValueOf(change) }}</code><t-tag v-if="change.status === '待评审' && store.currentThemeValueOf(change) !== change.diff.before && store.currentThemeValueOf(change) !== change.diff.after" size="small" theme="danger" variant="light">已偏离基线</t-tag><t-tag v-else-if="change.status === '待评审' && store.currentThemeValueOf(change) === change.diff.after" size="small" theme="success" variant="light">其他提案已应用</t-tag></div>
+              <div v-if="change.status === '冲突待决'" class="conflict-box">
+                <strong>冲突令牌 {{ change.diff.token }}</strong>
+                <div class="conflict-values"><div><span>保留当前值</span><code>{{ change.conflictCurrent }}</code></div><div><span>提案目标值</span><code>{{ change.diff.after }}</code></div></div>
+                <div class="conflict-actions"><t-button size="small" variant="outline" @click="resolveConflict(change.id, 'ours')">保留当前值并退回</t-button><t-button size="small" theme="primary" @click="resolveConflict(change.id, 'theirs')">采用提案值并接受</t-button></div>
+              </div>
               <div class="impact"><span>影响评分</span><t-progress :percentage="change.impact" :theme="change.impact > 70 ? 'danger' : 'warning'" /></div>
-              <div class="change-actions"><t-button variant="outline" :disabled="change.status !== '待评审'" @click="store.rejectChange(change.id)">退回并说明</t-button><t-button theme="primary" :disabled="change.status !== '待评审'" @click="store.acceptChange(change.id)">接受变更</t-button></div>
+              <div class="change-actions"><t-button variant="outline" :disabled="change.status !== '待评审'" @click="store.rejectChange(change.id)">退回并说明</t-button><t-button theme="primary" :disabled="change.status !== '待评审'" @click="acceptChange(change.id)">按合并规则接受</t-button></div>
             </div>
           </div>
         </section>
@@ -240,12 +297,27 @@ function publish() {
               <label><t-checkbox checked /> 循环依赖检查通过</label>
               <label><t-checkbox checked /> 无效引用检查通过</label>
               <label><t-checkbox :checked="store.contrastIssues.length === 0" /> 颜色对比度符合 WCAG AA</label>
-              <label><t-checkbox :checked="store.changes.every(c => c.status !== '待评审')" /> 所有变更请求已处理</label>
+              <label><t-checkbox :checked="!store.changes.some(c => c.status === '待评审')" /> 所有变更请求已处理</label>
+              <label><t-checkbox :checked="store.conflictChanges.length === 0" /> 合并冲突已全部人工裁决</label>
             </div>
-            <div class="publish-actions"><t-button variant="outline" @click="store.rollback">回滚全部未发布编辑</t-button><t-button theme="primary" icon="lock-on" :disabled="store.locked || store.changes.some(c => c.status === '待评审')" @click="publish">校验并锁定发布</t-button></div>
+            <div v-if="store.conflictChanges.length" class="publish-conflict">
+              <t-icon name="error-circle" />
+              <span>{{ store.conflictChanges.length }} 条提案仍处冲突待决（{{ store.conflictTokens.join('、') }}），发布锁定前请先到评审页裁决。</span>
+            </div>
+            <div class="publish-actions"><t-button variant="outline" @click="store.rollback">回滚全部未发布编辑</t-button><t-button theme="primary" icon="lock-on" :disabled="store.locked || store.changes.some(c => c.status === '待评审' || c.status === '冲突待决')" @click="publish">校验并锁定发布</t-button></div>
           </div>
           <aside class="publish-side">
+            <div class="panel snapshot-panel">
+              <div class="panel-head"><div><strong>主题合并汇总</strong><span>发布前按主题叠加已接受提案</span></div><t-tag theme="primary" variant="light">{{ store.changes.filter(c => c.status === '已接受').length }} 条已接受</t-tag></div>
+              <p class="snapshot-hint">接受时只更新提案声明的主题；冲突提案在人工裁决前不进入发布快照。</p>
+              <div v-for="group in themeGroups" :key="group.theme" class="snapshot-group">
+                <div class="snapshot-theme"><i :class="group.theme" /><strong>{{ themeLabel(group.theme) }}</strong><t-tag size="small" variant="light">{{ group.items.length }} 令牌</t-tag></div>
+                <div v-for="item in group.items" :key="`${group.theme}-${item.id}`" class="snapshot-row"><span>{{ item.name }}</span><div><del>{{ item.before }}</del><ins>{{ item.after }}</ins></div></div>
+              </div>
+              <p v-if="!themeGroups.length" class="empty">暂无已接受提案，发布快照将与发布基线一致。</p>
+            </div>
             <div class="panel diff-panel"><div class="panel-head"><div><strong>版本差异</strong><span>相对 {{ store.lastPublished }}</span></div><t-tag>{{ store.diffRows.length }} 项</t-tag></div><div v-for="row in store.diffRows" :key="row.id" class="diff-row"><strong>{{ row.name }}</strong><span>{{ row.id }}</span><div><del>{{ row.before }}</del><ins>{{ row.after }}</ins></div></div><p v-if="!store.diffRows.length" class="empty">暂无未发布差异。</p></div>
+            <div v-if="store.releaseSnapshot" class="panel history-panel"><div class="panel-head"><div><strong>发布快照</strong><span>{{ store.releaseSnapshot.version }} · 只读</span></div></div><div v-for="group in store.releaseSnapshot.themes" :key="group.theme" class="history-row"><t-tag theme="success" variant="light">{{ group.label }}</t-tag><div><strong>{{ group.changes.length }} 项变更</strong><span>{{ group.changes.map(c => c.tokenName).join('、') || '与基线一致' }}</span></div></div></div>
             <div class="panel history-panel"><div class="panel-head"><div><strong>发布历史</strong><span>可追溯版本</span></div><HistoryIcon /></div><div class="history-row"><t-tag theme="success" variant="light">当前</t-tag><div><strong>DS {{ store.lastPublished }}</strong><span>顾清 · 09-24 17:20</span></div><t-button size="small" variant="text">查看</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.1</strong><span>周序 · 09-12 11:04</span></div><t-button size="small" variant="text">回滚</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.0</strong><span>顾清 · 08-28 15:42</span></div><t-button size="small" variant="text">回滚</t-button></div></div>
           </aside>
         </section>

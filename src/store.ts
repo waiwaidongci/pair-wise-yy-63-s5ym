@@ -1,4 +1,6 @@
 import { defineStore } from 'pinia';
+import { evaluateMerge, type MergeVerdict } from './merge';
+import { buildReleaseSnapshot, type ReleaseSnapshot } from './snapshot';
 
 export type TokenCategory = 'color' | 'font' | 'spacing' | 'radius' | 'shadow' | 'component';
 export type Token = {
@@ -13,15 +15,25 @@ export type Token = {
   description: string;
 };
 
+export type ChangeStatus = '待评审' | '已接受' | '已退回' | '冲突待决';
 export type ChangeRequest = {
   id: string;
   title: string;
   requester: string;
   scope: string;
   impact: number;
-  status: '待评审' | '已接受' | '已退回';
+  status: ChangeStatus;
+  /** 发起时作用的主题：接受时只更新该主题 */
+  theme: string;
+  /** 发起时的发布基线版本，用于识别旧页面提交 */
+  baseVersion: string;
   diff: { token: string; before: string; after: string };
+  /** 合并冲突时保留下来的当前值（双方修改均不丢失） */
+  conflictCurrent?: string;
+  conflictReason?: MergeVerdict['reason'];
 };
+
+export type BaselineEntry = { id: string; value: string; themes: Record<string, string> };
 
 const initialTokens: Token[] = [
   { id: 'color.base.blue.600', name: '品牌主色 600', category: 'color', value: '#2864dc', themes: { light: '#2864dc', dark: '#6f96ff', ops: '#24786a', contrast: '#0b4dba' }, usage: 184, status: 'stable', description: '主操作、链接和重点状态' },
@@ -30,10 +42,11 @@ const initialTokens: Token[] = [
   { id: 'color.base.blue.800', name: '品牌蓝 800', category: 'color', value: '#0b4dba', themes: { light: '#0b4dba', dark: '#9ab9ff', ops: '#145c51', contrast: '#06358a' }, usage: 31, status: 'stable', description: '高对比主题主色' },
   { id: 'color.base.green.600', name: '运营绿 600', category: 'color', value: '#24786a', themes: { light: '#24786a', dark: '#54b2a0', ops: '#24786a', contrast: '#0d5a4d' }, usage: 67, status: 'proposed', description: '运营产品品牌替换色' },
   { id: 'color.text.primary', name: '正文主色', category: 'color', value: '#17202b', themes: { light: '#17202b', dark: '#f5f7fa', ops: '#152a25', contrast: '#000000' }, usage: 293, status: 'stable', description: '主要正文和标题' },
-  { id: 'color.text.secondary', name: '正文次色', category: 'color', value: '#667582', themes: { light: '#667582', dark: '#a8b2bd', ops: '#62766f', contrast: '#303b46' }, usage: 211, status: 'stable', description: '辅助信息和说明' },
+  // light 取值相对发布基线 #667582 已有一版未发布草稿，用于演示草稿冲突
+  { id: 'color.text.secondary', name: '正文次色', category: 'color', value: '#60707d', themes: { light: '#60707d', dark: '#a8b2bd', ops: '#62766f', contrast: '#303b46' }, usage: 211, status: 'stable', description: '辅助信息和说明' },
   { id: 'color.surface.canvas', name: '页面背景', category: 'color', value: '#f2f5f7', themes: { light: '#f2f5f7', dark: '#121821', ops: '#f1f6f4', contrast: '#ffffff' }, usage: 54, status: 'stable', description: '应用一级背景' },
   { id: 'font.family.sans', name: '无衬线字体', category: 'font', value: '"Noto Sans SC", sans-serif', themes: { light: '"Noto Sans SC", sans-serif', dark: '"Noto Sans SC", sans-serif', ops: '"Noto Sans SC", sans-serif', contrast: 'system-ui, sans-serif' }, usage: 388, status: 'stable', description: '产品界面默认真体' },
-  { id: 'font.size.body', name: '正文字号', category: 'font', value: '14px', themes: { light: '14px', dark: '14px', ops: '14px', contrast: '16px' }, usage: 255, status: 'stable', description: '正文与表单文本' },
+  { id: 'font.size.body', name: '正文字号', category: 'font', value: '14px', themes: { light: '14px', dark: '14px', ops: '14px', contrast: '14px' }, usage: 255, status: 'stable', description: '正文与表单文本' },
   { id: 'spacing.base.2', name: '基础间距 2', category: 'spacing', value: '8px', themes: { light: '8px', dark: '8px', ops: '8px', contrast: '8px' }, usage: 312, status: 'stable', description: '紧凑布局基础间距' },
   { id: 'radius.control', name: '控件圆角', category: 'radius', value: '6px', themes: { light: '6px', dark: '6px', ops: '4px', contrast: '4px' }, usage: 167, status: 'stable', description: '按钮、输入框和卡片' },
   { id: 'shadow.raised', name: '浮层阴影', category: 'shadow', value: '0 8px 28px rgba(22,35,48,.14)', themes: { light: '0 8px 28px rgba(22,35,48,.14)', dark: '0 8px 28px rgba(0,0,0,.42)', ops: '0 8px 28px rgba(21,54,45,.14)', contrast: '0 0 0 2px #303b46' }, usage: 36, status: 'stable', description: '菜单、弹窗和浮层' },
@@ -41,28 +54,60 @@ const initialTokens: Token[] = [
   { id: 'component.button.primary.text', name: '主按钮文字', category: 'component', value: '#ffffff', themes: { light: '#ffffff', dark: '#ffffff', ops: '#ffffff', contrast: '#ffffff' }, usage: 98, status: 'stable', description: '主要操作按钮文字' }
 ];
 
+const baseRelease = 'DS 4.5.2';
+
+// 发布基线快照：上一版 DS 4.5.2 发布时各主题的取值
+const releaseBaseline: BaselineEntry[] = initialTokens.map((token) => ({
+  id: token.id,
+  value: token.value,
+  themes: { ...token.themes }
+}));
+// 正文次色的 light 草稿（#60707d）尚未发布，基线仍是上一版取值
+const secondaryBaseline = releaseBaseline.find((entry) => entry.id === 'color.text.secondary')!;
+secondaryBaseline.value = '#667582';
+secondaryBaseline.themes.light = '#667582';
+
 const changes: ChangeRequest[] = [
-  { id: 'CR-412', title: '运营产品切换语义主色', requester: '运营设计组', scope: '4 个产品 · 238 处引用', impact: 86, status: '待评审', diff: { token: 'color.semantic.primary', before: '{color.base.blue.600}', after: '{color.base.green.600}' } },
-  { id: 'CR-418', title: '高对比度正文尺寸调整', requester: '无障碍专项组', scope: '2 个产品 · 74 处引用', impact: 42, status: '待评审', diff: { token: 'font.size.body', before: '14px', after: '16px' } },
-  { id: 'CR-423', title: '统一浮层圆角', requester: '组件维护组', scope: '12 个组件 · 36 处引用', impact: 28, status: '待评审', diff: { token: 'radius.control', before: '8px', after: '6px' } }
+  { id: 'CR-412', title: '运营产品切换语义主色', requester: '运营设计组', scope: '4 个产品 · 238 处引用', impact: 86, status: '待评审', theme: 'ops', baseVersion: 'DS 4.5.1', diff: { token: 'color.semantic.primary', before: '{color.base.blue.600}', after: '{color.base.green.600}' } },
+  { id: 'CR-418', title: '高对比度正文尺寸调整', requester: '无障碍专项组', scope: '2 个产品 · 74 处引用', impact: 42, status: '待评审', theme: 'contrast', baseVersion: baseRelease, diff: { token: 'font.size.body', before: '14px', after: '16px' } },
+  { id: 'CR-423', title: '统一浮层圆角', requester: '组件维护组', scope: '12 个组件 · 36 处引用', impact: 28, status: '待评审', theme: 'light', baseVersion: baseRelease, diff: { token: 'radius.control', before: '6px', after: '8px' } },
+  { id: 'CR-427', title: '收紧明亮主题控件圆角', requester: '移动端组件组', scope: '3 个产品 · 18 处引用', impact: 24, status: '待评审', theme: 'light', baseVersion: baseRelease, diff: { token: 'radius.control', before: '6px', after: '5px' } },
+  { id: 'CR-431', title: '暗色浮层阴影减弱', requester: '组件维护组', scope: '9 个组件 · 21 处引用', impact: 18, status: '待评审', theme: 'dark', baseVersion: baseRelease, diff: { token: 'shadow.raised', before: '0 8px 28px rgba(0,0,0,.42)', after: '0 6px 20px rgba(0,0,0,.34)' } },
+  { id: 'CR-433', title: '运营浮层阴影加重', requester: '运营设计组', scope: '2 个产品 · 12 处引用', impact: 16, status: '待评审', theme: 'ops', baseVersion: baseRelease, diff: { token: 'shadow.raised', before: '0 8px 28px rgba(21,54,45,.14)', after: '0 10px 30px rgba(21,54,45,.20)' } },
+  { id: 'CR-435', title: '正文次色降饱和（旧页面提交）', requester: '运营设计组', scope: '1 个产品 · 56 处引用', impact: 33, status: '待评审', theme: 'light', baseVersion: 'DS 4.5.1', diff: { token: 'color.text.secondary', before: '#667582', after: '#5d6b76' } }
 ];
 
-const storageKey = 'yy63-token-governance';
+const storageKey = 'yy63-token-governance-v2';
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(storageKey) : null;
 const saved = raw ? JSON.parse(raw) : null;
+
+// 兼容旧草稿：补齐基线版本与作用主题字段
+function normalizeChange(change: Partial<ChangeRequest> & { id: string; diff: ChangeRequest['diff'] }): ChangeRequest {
+  return {
+    title: change.title ?? change.id,
+    requester: change.requester ?? '未知提交方',
+    scope: change.scope ?? '',
+    impact: change.impact ?? 0,
+    status: change.status === '冲突待决' ? '冲突待决' : change.status ?? '待评审',
+    theme: change.theme ?? 'light',
+    baseVersion: change.baseVersion ?? baseRelease,
+    ...change
+  } as ChangeRequest;
+}
 
 export const useTokenStore = defineStore('tokens', {
   state: () => ({
     tokens: (saved?.tokens as Token[]) ?? initialTokens,
-    changes: (saved?.changes as ChangeRequest[]) ?? changes,
+    changes: ((saved?.changes as ChangeRequest[]) ?? changes).map(normalizeChange),
     activeTheme: (saved?.activeTheme as string) ?? 'light',
     selectedTokenId: (saved?.selectedTokenId as string) ?? 'color.semantic.primary',
     search: (saved?.search as string) ?? '',
     category: (saved?.category as string) ?? '全部',
     releaseVersion: '4.6.0-rc.2',
     locked: (saved?.locked as boolean) ?? false,
-    lastPublished: (saved?.lastPublished as string) ?? 'DS 4.5.2',
-    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value }))
+    lastPublished: (saved?.lastPublished as string) ?? baseRelease,
+    baseline: releaseBaseline,
+    releaseSnapshot: (saved?.releaseSnapshot as ReleaseSnapshot | null) ?? null
   }),
   getters: {
     selectedToken(state): Token | undefined {
@@ -115,8 +160,14 @@ export const useTokenStore = defineStore('tokens', {
         return { id: token.id, before: base?.value ?? '新增', after: token.value, name: token.name };
       });
     },
+    conflictChanges(state): ChangeRequest[] {
+      return state.changes.filter((change) => change.status === '冲突待决');
+    },
+    conflictTokens(state): string[] {
+      return [...new Set(state.changes.filter((change) => change.status === '冲突待决').map((change) => change.diff.token))];
+    },
     releaseReadiness(state): number {
-      const base = 100 - this.cycleNodes.length * 25 - this.invalidReferences.length * 20 - this.contrastIssues.length * 15;
+      const base = 100 - this.cycleNodes.length * 25 - this.invalidReferences.length * 20 - this.contrastIssues.length * 15 - this.conflictChanges.length * 10;
       return Math.max(0, base);
     }
   },
@@ -144,12 +195,55 @@ export const useTokenStore = defineStore('tokens', {
     },
     setSearch(value: string) { this.search = value; this.persist(); },
     setCategory(value: string) { this.category = value; this.persist(); },
-    acceptChange(id: string) {
-      const change = this.changes.find((item) => item.id === id);
-      if (!change) return;
+    /** 提案当前作用主题上的实际取值，供评审页比对展示 */
+    currentThemeValueOf(change: ChangeRequest): string {
       const token = this.tokens.find((item) => item.id === change.diff.token);
-      if (token) this.updateTokenValue(token.id, change.diff.after);
-      change.status = '已接受';
+      return token?.themes[change.theme] ?? token?.value ?? '—';
+    },
+    /**
+     * 接受提案：先跑 3-way merge 判定。
+     * - 干净合并 / 幂等：只写提案作用主题，其他主题保持不动；
+     * - 冲突：不写入任何值，保留双方取值并把提案置为冲突待决。
+     */
+    acceptChange(id: string): MergeVerdict {
+      const change = this.changes.find((item) => item.id === id);
+      if (!change) return { kind: 'conflict', reason: 'missing-token', conflictTokens: [] };
+      const siblings = this.changes.filter((other) => other.diff.token === change.diff.token);
+      const verdict = evaluateMerge(change, `DS ${this.releaseVersion}`, this.tokens, siblings);
+
+      if (verdict.kind === 'merge') {
+        const token = this.tokens.find((item) => item.id === change.diff.token);
+        if (token) {
+          token.themes[change.theme] = change.diff.after;
+          if (change.theme === this.activeTheme) token.value = change.diff.after;
+        }
+        change.status = '已接受';
+        change.conflictCurrent = undefined;
+        change.conflictReason = undefined;
+      } else {
+        change.status = '冲突待决';
+        change.conflictCurrent = verdict.currentValue;
+        change.conflictReason = verdict.reason;
+      }
+      this.persist();
+      return verdict;
+    },
+    /** 人工解决冲突：采用提案值（theirs）或保留当前值（ours） */
+    resolveConflict(id: string, choice: 'theirs' | 'ours') {
+      const change = this.changes.find((item) => item.id === id);
+      if (!change || change.status !== '冲突待决') return;
+      if (choice === 'theirs') {
+        const token = this.tokens.find((item) => item.id === change.diff.token);
+        if (token) {
+          token.themes[change.theme] = change.diff.after;
+          if (change.theme === this.activeTheme) token.value = change.diff.after;
+        }
+        change.status = '已接受';
+      } else {
+        change.status = '已退回';
+      }
+      change.conflictCurrent = undefined;
+      change.conflictReason = undefined;
       this.persist();
     },
     rejectChange(id: string) {
@@ -160,19 +254,38 @@ export const useTokenStore = defineStore('tokens', {
     rollback() {
       this.baseline.forEach((base) => {
         const token = this.tokens.find((item) => item.id === base.id);
-        if (token) token.value = base.value;
+        if (token) {
+          token.value = base.value;
+          token.themes = { ...base.themes };
+        }
       });
       this.persist();
     },
+    /** 发布前按主题汇总已接受提案，生成只读快照 */
+    buildSnapshot(version: string): ReleaseSnapshot {
+      const snapshot = buildReleaseSnapshot(`DS ${version}`, this.tokens, this.changes, this.baseline);
+      this.releaseSnapshot = snapshot;
+      this.persist();
+      return snapshot;
+    },
+    publishRelease(version: string) {
+      this.buildSnapshot(version);
+      const blocked = this.changes.some((item) => item.status === '待评审' || item.status === '冲突待决');
+      if (!blocked && this.cycleNodes.length === 0 && this.invalidReferences.length === 0 && this.contrastIssues.length === 0) {
+        this.locked = true;
+        this.lastPublished = `DS ${version}`;
+      }
+      this.persist();
+    },
     lockRelease() {
-      if (this.cycleNodes.length === 0 && this.invalidReferences.length === 0 && this.contrastIssues.length === 0 && this.changes.every((item) => item.status !== '待评审')) {
+      if (this.cycleNodes.length === 0 && this.invalidReferences.length === 0 && this.contrastIssues.length === 0 && this.changes.every((item) => item.status !== '待评审' && item.status !== '冲突待决')) {
         this.locked = true;
         this.lastPublished = `DS ${this.releaseVersion}`;
       }
       this.persist();
     },
     persist() {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished }));
+      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished, releaseSnapshot: this.releaseSnapshot }));
     }
   }
 });
