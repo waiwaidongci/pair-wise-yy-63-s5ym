@@ -160,6 +160,53 @@ button, input, textarea { font: inherit; }
 .release-success h3 { margin: 12px 0 6px; }
 .release-success p { color: var(--muted); font-size: 12px; }
 
+/* 版本基线评审合并 */
+.review-summary strong.bad { color: var(--red); }
+.review-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 13px; }
+.review-toolbar p { margin: 0; color: var(--muted); font-size: 10.5px; }
+.conflict-banner { margin-bottom: 13px; border-color: #e2b4b4; }
+.conflict-banner .panel-head strong { color: var(--red); }
+.conflict-group { border-top: 1px solid #f0dada; }
+.conflict-token { display: flex; align-items: center; gap: 9px; padding: 12px 15px; background: #fdf6f6; color: var(--red); }
+.conflict-token svg { font-size: 17px; flex: none; }
+.conflict-token strong, .conflict-token code { display: block; }
+.conflict-token strong { font-size: 12px; color: var(--ink); }
+.conflict-token code { font-size: 9.5px; color: var(--muted); margin: 3px 0; }
+.conflict-item { padding: 10px 15px 12px 41px; border-top: 1px dashed #ecd2d2; }
+.conflict-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.conflict-meta span { font-size: 11px; font-weight: 700; }
+.conflict-meta small { color: var(--muted); font-size: 9px; }
+.conflict-values { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 9px 0; }
+.conflict-values .cv { background: #f6f8fa; border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; }
+.conflict-values .cv.current { border-color: #d9b26a; background: #fdf8ee; }
+.conflict-values .cv.proposed { border-color: #a9c0ed; background: #f0f5fd; }
+.conflict-values span { display: block; color: var(--muted); font-size: 8px; margin-bottom: 4px; }
+.conflict-values code { font-size: 10px; overflow-wrap: anywhere; }
+.conflict-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.change-meta { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+.verdict-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 12px; padding: 8px 10px; background: #f8fafb; border: 1px solid var(--line); border-radius: 4px; }
+.verdict-row code { font-size: 10px; padding: 3px 6px; border-radius: 3px; }
+.verdict-current { color: #8a5a12; background: #fdf2dd; }
+.verdict-proposed { color: #1c4f9e; background: #e8f0fd; }
+.verdict-vs { color: var(--muted); font-size: 9px; }
+.verdict-note { color: var(--muted); font-size: 9.5px; }
+.submit-hint { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
+
+.publish-conflict { padding: 12px 15px; border-bottom: 1px solid #f0dada; }
+.theme-summary-panel { border: 0; border-top: 1px solid var(--line); border-radius: 0; }
+.theme-summary { display: grid; gap: 0; }
+.theme-group { border-top: 1px solid #edf1f3; padding: 10px 15px; }
+.theme-group-head { display: flex; align-items: center; gap: 9px; margin-bottom: 7px; }
+.theme-group-head span { color: var(--muted); font-size: 9px; }
+.theme-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.theme-item-main { flex: 1; min-width: 0; }
+.theme-item-main strong, .theme-item-main code { display: block; }
+.theme-item-main strong { font-size: 11px; }
+.theme-item-main code { font-size: 9px; color: var(--muted); margin-top: 2px; overflow-wrap: anywhere; }
+.release-result { margin: 0; padding: 0 16px 13px; color: #17664b; font-size: 10.5px; }
+.snapshot-view pre { max-height: 420px; overflow: auto; background: #1e2530; color: #d8e2ee; border-radius: 5px; padding: 12px; font-size: 10px; line-height: 1.55; }
+.snapshot-meta { color: var(--muted); font-size: 10.5px; margin: 0 0 10px; }
+
 @media (max-width: 1250px) {
   .token-workspace { grid-template-columns: 280px minmax(400px, 1fr); }
   .preview-column { grid-column: 1 / -1; grid-template-columns: 1fr 1fr; }
@@ -196,4 +243,6 @@ button, input, textarea { font: inherit; }
   .publish-form label:nth-child(3) { grid-column: auto; }
   .diff-box { grid-template-columns: 1fr; }
   .diff-box > .t-icon { transform: rotate(90deg); }
+  .conflict-values { grid-template-columns: 1fr; }
+  .conflict-item { padding-left: 15px; }
 }

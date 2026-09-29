@@ -7,20 +7,20 @@ import {
   AddIcon,
   ArrowRightIcon,
   CopyIcon,
-  HistoryIcon,
   LockOnIcon,
   RefreshIcon,
   SearchIcon,
   SwapIcon
 } from 'tdesign-icons-vue-next';
 import TokenEditor from './components/TokenEditor.vue';
+import ReviewPage from './components/ReviewPage.vue';
+import PublishPage from './components/PublishPage.vue';
 import { fetchTokens, submitRelease, type Token } from './api';
 import { useTokenStore } from './store';
 
 const AddButtonIcon = () => h(AddIcon);
 const ArrowRightButtonIcon = () => h(ArrowRightIcon);
 const CopyButtonIcon = () => h(CopyIcon);
-const HistoryButtonIcon = () => h(HistoryIcon);
 const LockButtonIcon = () => h(LockOnIcon);
 const RefreshButtonIcon = () => h(RefreshIcon);
 const SearchInputIcon = () => h(SearchIcon);
@@ -139,9 +139,14 @@ function batchReplace() {
 }
 
 function publish() {
+  // 快照生成与合并门禁由 store 统一负责，冲突未裁决时不会锁定。
+  const result = store.lockRelease(selectedVersion.value);
+  if (!result.ok) {
+    MessagePlugin.error(result.error ?? '发布校验未通过');
+    return;
+  }
   const accepted = store.changes.filter((item) => item.status === '已接受').map((item) => item.id);
   releaseMutation.mutate({ version: selectedVersion.value, accepted, actor: '设计系统维护员' });
-  store.lockRelease();
   releaseDialog.value = true;
 }
 </script>
@@ -164,7 +169,7 @@ function publish() {
       <t-content class="main-content">
         <header class="page-heading">
           <div><small>{{ store.locked ? 'RELEASE LOCKED' : 'GOVERNANCE WORKBENCH' }} / {{ pageTitle }}</small><h1>{{ pageTitle }}</h1><p>基础令牌到语义令牌的引用、差异、校验与跨主题发布。</p></div>
-          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="[{label:'明亮模式',value:'light'},{label:'暗色模式',value:'dark'},{label:'运营模式',value:'ops'},{label:'高对比度',value:'contrast'}]" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" :disabled="store.locked" @click="publish">发布主题</t-button></div>
+          <div class="heading-actions"><t-select v-model="store.activeTheme" style="width: 150px" :options="[{label:'明亮模式',value:'light'},{label:'暗色模式',value:'dark'},{label:'运营模式',value:'ops'},{label:'高对比度',value:'contrast'}]" /><t-button variant="outline" :icon="AddButtonIcon" @click="newTokenDialog = true">新建令牌</t-button><t-button theme="primary" :icon="LockButtonIcon" :disabled="store.locked || store.hasPendingConflicts" @click="publish">发布主题</t-button></div>
         </header>
 
         <section v-if="route.path === '/'" class="token-workspace">
@@ -216,39 +221,10 @@ function publish() {
           <div class="validation-strip"><div class="validation-card"><t-icon name="check-circle" theme="success" /><div><strong>循环依赖</strong><span>{{ store.cycleNodes.length ? store.cycleNodes.join(' → ') : '未发现循环引用路径' }}</span></div></div><div class="validation-card"><t-icon :name="store.invalidReferences.length ? 'error-circle' : 'check-circle'" :theme="store.invalidReferences.length ? 'danger' : 'success'" /><div><strong>引用完整性</strong><span>{{ store.invalidReferences.length ? store.invalidReferences.map(t => t.ref).join('、') : '所有引用均指向已发布令牌' }}</span></div></div><div class="validation-card"><t-icon :name="store.contrastIssues.length ? 'error-circle' : 'check-circle'" :theme="store.contrastIssues.length ? 'danger' : 'success'" /><div><strong>对比度检查</strong><span>{{ store.contrastIssues[0]?.detail ?? '正文与背景对比度 13.8:1' }}</span></div></div></div>
         </section>
 
-        <section v-else-if="route.path === '/review'" class="review-page">
-          <div class="review-summary panel"><div><span>待评审变更</span><strong>{{ store.changes.filter(c => c.status === '待评审').length }}</strong></div><div><span>已接受</span><strong>{{ store.changes.filter(c => c.status === '已接受').length }}</strong></div><div><span>已退回</span><strong>{{ store.changes.filter(c => c.status === '已退回').length }}</strong></div><div><span>受影响组件</span><strong>48</strong></div></div>
-          <div class="review-grid">
-            <div v-for="change in store.changes" :key="change.id" class="panel change-card">
-              <div class="change-head"><div><t-tag size="small">{{ change.id }}</t-tag><strong>{{ change.title }}</strong><span>{{ change.requester }} · {{ change.scope }}</span></div><t-tag :theme="change.status === '已接受' ? 'success' : change.status === '已退回' ? 'danger' : 'warning'" variant="light">{{ change.status }}</t-tag></div>
-              <div class="diff-box"><div><span>修改前</span><code>{{ change.diff.before }}</code></div><t-icon name="arrow-right" /><div><span>修改后</span><code>{{ change.diff.after }}</code></div></div>
-              <div class="impact"><span>影响评分</span><t-progress :percentage="change.impact" :theme="change.impact > 70 ? 'danger' : 'warning'" /></div>
-              <div class="change-actions"><t-button variant="outline" :disabled="change.status !== '待评审'" @click="store.rejectChange(change.id)">退回并说明</t-button><t-button theme="primary" :disabled="change.status !== '待评审'" @click="store.acceptChange(change.id)">接受变更</t-button></div>
-            </div>
-          </div>
-        </section>
+        <ReviewPage v-else-if="route.path === '/review'" />
 
-        <section v-else class="publish-page">
-          <div class="panel publish-main">
-            <div class="panel-head"><div><strong>发布准备</strong><span>生成只读版本，支持回滚到历史基线</span></div><t-tag :theme="store.locked ? 'success' : 'warning'">{{ store.locked ? '已锁定' : '候选版本' }}</t-tag></div>
-            <div class="publish-form">
-              <label><span>版本号</span><t-input v-model="selectedVersion" /></label>
-              <label><span>目标产品</span><t-select multiple value="['组件库','运营后台','移动端组件']" :options="[{label:'组件库',value:'组件库'},{label:'运营后台',value:'运营后台'},{label:'移动端组件',value:'移动端组件'},{label:'数据平台',value:'数据平台'}]" /></label>
-              <label><span>发布说明</span><t-textarea value="更新语义主色、统一控件圆角，并修复暗色主题正文对比度。" :autosize="{ minRows: 3 }" /></label>
-            </div>
-            <div class="release-checks">
-              <label><t-checkbox checked /> 循环依赖检查通过</label>
-              <label><t-checkbox checked /> 无效引用检查通过</label>
-              <label><t-checkbox :checked="store.contrastIssues.length === 0" /> 颜色对比度符合 WCAG AA</label>
-              <label><t-checkbox :checked="store.changes.every(c => c.status !== '待评审')" /> 所有变更请求已处理</label>
-            </div>
-            <div class="publish-actions"><t-button variant="outline" @click="store.rollback">回滚全部未发布编辑</t-button><t-button theme="primary" icon="lock-on" :disabled="store.locked || store.changes.some(c => c.status === '待评审')" @click="publish">校验并锁定发布</t-button></div>
-          </div>
-          <aside class="publish-side">
-            <div class="panel diff-panel"><div class="panel-head"><div><strong>版本差异</strong><span>相对 {{ store.lastPublished }}</span></div><t-tag>{{ store.diffRows.length }} 项</t-tag></div><div v-for="row in store.diffRows" :key="row.id" class="diff-row"><strong>{{ row.name }}</strong><span>{{ row.id }}</span><div><del>{{ row.before }}</del><ins>{{ row.after }}</ins></div></div><p v-if="!store.diffRows.length" class="empty">暂无未发布差异。</p></div>
-            <div class="panel history-panel"><div class="panel-head"><div><strong>发布历史</strong><span>可追溯版本</span></div><HistoryIcon /></div><div class="history-row"><t-tag theme="success" variant="light">当前</t-tag><div><strong>DS {{ store.lastPublished }}</strong><span>顾清 · 09-24 17:20</span></div><t-button size="small" variant="text">查看</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.1</strong><span>周序 · 09-12 11:04</span></div><t-button size="small" variant="text">回滚</t-button></div><div class="history-row"><t-tag>历史</t-tag><div><strong>DS 4.5.0</strong><span>顾清 · 08-28 15:42</span></div><t-button size="small" variant="text">回滚</t-button></div></div>
-          </aside>
-        </section>
+        <PublishPage v-else v-model="selectedVersion" :release-result="releaseResult" @publish="publish" @rollback="store.rollback" />
+
       </t-content>
     </t-layout>
   </t-layout>

@@ -1,4 +1,6 @@
 import { defineStore } from 'pinia';
+import { classifyMerge, collectConflictTokens, type ConflictToken, type MergeState, type MergeVerdict } from './release/merge';
+import { buildReleaseSnapshot, snapshotProposal, type ReleaseSnapshot } from './release/snapshot';
 
 export type TokenCategory = 'color' | 'font' | 'spacing' | 'radius' | 'shadow' | 'component';
 export type Token = {
@@ -21,6 +23,17 @@ export type ChangeRequest = {
   impact: number;
   status: '待评审' | '已接受' | '已退回';
   diff: { token: string; before: string; after: string };
+  /** 提案发起时的发布版本基线 */
+  baseVersion: string;
+  /** 提案作用的主题，接受时只更新该主题 */
+  theme: string;
+  /** 发起基线中该主题下的令牌值（三方合并的共同祖先） */
+  baseValue: string;
+  /** 版本基线三方合并状态 */
+  mergeState: MergeState;
+  /** 冲突待裁决时保留双方修改 */
+  conflict?: { base: string; current: string; proposed: string };
+  createdAt?: number;
 };
 
 const initialTokens: Token[] = [
@@ -41,28 +54,65 @@ const initialTokens: Token[] = [
   { id: 'component.button.primary.text', name: '主按钮文字', category: 'component', value: '#ffffff', themes: { light: '#ffffff', dark: '#ffffff', ops: '#ffffff', contrast: '#ffffff' }, usage: 98, status: 'stable', description: '主要操作按钮文字' }
 ];
 
-const changes: ChangeRequest[] = [
-  { id: 'CR-412', title: '运营产品切换语义主色', requester: '运营设计组', scope: '4 个产品 · 238 处引用', impact: 86, status: '待评审', diff: { token: 'color.semantic.primary', before: '{color.base.blue.600}', after: '{color.base.green.600}' } },
-  { id: 'CR-418', title: '高对比度正文尺寸调整', requester: '无障碍专项组', scope: '2 个产品 · 74 处引用', impact: 42, status: '待评审', diff: { token: 'font.size.body', before: '14px', after: '16px' } },
-  { id: 'CR-423', title: '统一浮层圆角', requester: '组件维护组', scope: '12 个组件 · 36 处引用', impact: 28, status: '待评审', diff: { token: 'radius.control', before: '8px', after: '6px' } }
+// CR-412 与 CR-413 同令牌同主题、目标值不同，模拟运营与组件团队同时提交。
+// CR-418 发起后该值被旧页面直接写成 16px（草稿已偏离基线），提案目标 18px，接受时暴露冲突。
+const seedChanges: ChangeRequest[] = [
+  { id: 'CR-412', title: '运营产品切换语义主色', requester: '运营设计组', scope: '4 个产品 · 238 处引用', impact: 86, status: '待评审', diff: { token: 'color.semantic.primary', before: '{color.base.blue.600}', after: '{color.base.green.600}' }, baseVersion: '4.5.2', theme: 'light', baseValue: '{color.base.blue.600}', mergeState: 'pending', createdAt: Date.now() - 1000 * 60 * 60 * 5 },
+  { id: 'CR-413', title: '语义主色改走蓝色 800', requester: '组件维护组', scope: '9 个组件 · 156 处引用', impact: 74, status: '待评审', diff: { token: 'color.semantic.primary', before: '{color.base.blue.600}', after: '{color.base.blue.800}' }, baseVersion: '4.5.2', theme: 'light', baseValue: '{color.base.blue.600}', mergeState: 'pending', createdAt: Date.now() - 1000 * 60 * 60 * 4 },
+  { id: 'CR-414', title: '运营主题控件圆角收紧', requester: '运营设计组', scope: '3 个产品 · 41 处引用', impact: 33, status: '待评审', diff: { token: 'radius.control', before: '4px', after: '3px' }, baseVersion: '4.5.2', theme: 'ops', baseValue: '4px', mergeState: 'pending', createdAt: Date.now() - 1000 * 60 * 60 * 3 },
+  { id: 'CR-418', title: '高对比度正文尺寸调整', requester: '无障碍专项组', scope: '2 个产品 · 74 处引用', impact: 42, status: '待评审', diff: { token: 'font.size.body', before: '14px', after: '18px' }, baseVersion: '4.5.2', theme: 'contrast', baseValue: '14px', mergeState: 'pending', createdAt: Date.now() - 1000 * 60 * 60 * 26 },
+  { id: 'CR-423', title: '统一暗色浮层圆角', requester: '组件维护组', scope: '12 个组件 · 36 处引用', impact: 28, status: '待评审', diff: { token: 'radius.control', before: '6px', after: '8px' }, baseVersion: '4.5.2', theme: 'dark', baseValue: '6px', mergeState: 'pending', createdAt: Date.now() - 1000 * 60 * 60 * 2 }
 ];
 
 const storageKey = 'yy63-token-governance';
 const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(storageKey) : null;
 const saved = raw ? JSON.parse(raw) : null;
 
+type BaselineRow = { id: string; value: string; themes: Record<string, string> };
+// DS 4.5.2 已发布基线；草稿中 contrast 正文字号 16px 是旧页面在基线之后直接写入的。
+const initialBaseline: BaselineRow[] = initialTokens.map((token) => ({
+  id: token.id,
+  value: token.value,
+  themes: { ...token.themes, ...(token.id === 'font.size.body' ? { contrast: '14px' } : {}) }
+}));
+
+// 旧版本草稿没有版本基线字段，迁移到新模型：发起版本按当前发布基线补齐。
+function migrateChanges(changes: ChangeRequest[] | undefined, releaseVersion: string): ChangeRequest[] {
+  if (!changes) return seedChanges;
+  return changes.map((change) => ({
+    ...change,
+    baseVersion: change.baseVersion ?? releaseVersion,
+    theme: change.theme ?? 'light',
+    baseValue: change.baseValue ?? change.diff.before,
+    mergeState: change.mergeState ?? (change.status === '已接受' ? 'already' : 'pending'),
+    conflict: change.conflict
+  }));
+}
+
+function migrateBaseline(savedRows: { id: string; value: string; themes?: Record<string, string> }[] | undefined, tokens: Token[]): BaselineRow[] {
+  if (!savedRows) return initialBaseline;
+  return savedRows.map((row) => {
+    const token = tokens.find((item) => item.id === row.id);
+    return { id: row.id, value: row.value, themes: row.themes ?? token?.themes ?? {} };
+  });
+}
+
 export const useTokenStore = defineStore('tokens', {
   state: () => ({
     tokens: (saved?.tokens as Token[]) ?? initialTokens,
-    changes: (saved?.changes as ChangeRequest[]) ?? changes,
+    changes: migrateChanges(saved?.changes as ChangeRequest[] | undefined, saved?.lastPublished ? String(saved.lastPublished).replace(/^DS\s*/, '') : '4.5.2'),
     activeTheme: (saved?.activeTheme as string) ?? 'light',
     selectedTokenId: (saved?.selectedTokenId as string) ?? 'color.semantic.primary',
     search: (saved?.search as string) ?? '',
     category: (saved?.category as string) ?? '全部',
-    releaseVersion: '4.6.0-rc.2',
+    releaseVersion: (saved?.releaseVersion as string) ?? '4.6.0-rc.2',
     locked: (saved?.locked as boolean) ?? false,
     lastPublished: (saved?.lastPublished as string) ?? 'DS 4.5.2',
-    baseline: initialTokens.map((token) => ({ id: token.id, value: token.value }))
+    themes: ['light', 'dark', 'ops', 'contrast'],
+    baseline: saved
+      ? migrateBaseline(saved.baseline as BaselineRow[] | undefined, (saved.tokens as Token[]) ?? initialTokens)
+      : initialBaseline,
+    releaseSnapshots: (saved?.releaseSnapshots as ReleaseSnapshot[]) ?? []
   }),
   getters: {
     selectedToken(state): Token | undefined {
@@ -106,13 +156,33 @@ export const useTokenStore = defineStore('tokens', {
       const ratio = contrastRatio(values[0], values[1]);
       return ratio < 4.5 ? [{ title: '正文与页面背景对比度不足', detail: `当前 ${ratio.toFixed(2)}:1，要求至少 4.5:1。` }] : [];
     },
+    conflictTokens(state): ConflictToken[] {
+      return collectConflictTokens(state.changes);
+    },
+    pendingConflictCount(): number {
+      return this.conflictTokens.reduce((total, group) => total + group.items.length, 0);
+    },
+    hasPendingConflicts(): boolean {
+      return this.pendingConflictCount > 0;
+    },
+    // 发布差异按主题比较：默认值或任一主题值偏离基线即列出，并标注偏离的主题。
     diffRows(state) {
-      return state.tokens.filter((token) => {
+      return state.tokens.flatMap((token) => {
         const base = state.baseline.find((item) => item.id === token.id);
-        return !base || base.value !== token.value;
-      }).map((token) => {
-        const base = state.baseline.find((item) => item.id === token.id);
-        return { id: token.id, before: base?.value ?? '新增', after: token.value, name: token.name };
+        if (!base) {
+          return [{ id: token.id, name: token.name, before: '新增', after: token.value, themes: [...state.themes] }];
+        }
+        const changedThemes = state.themes.filter((theme) => (token.themes[theme] ?? '') !== (base.themes[theme] ?? ''));
+        if (token.value === base.value && changedThemes.length === 0) return [];
+        const rows: { id: string; name: string; before: string; after: string; themes: string[] }[] = [];
+        if (changedThemes.length) {
+          changedThemes.forEach((theme) => {
+            rows.push({ id: token.id, name: token.name, before: base.themes[theme] ?? '新增', after: token.themes[theme] ?? '', themes: [theme] });
+          });
+        } else {
+          rows.push({ id: token.id, name: token.name, before: base.value, after: token.value, themes: [] });
+        }
+        return rows;
       });
     },
     releaseReadiness(state): number {
@@ -144,12 +214,70 @@ export const useTokenStore = defineStore('tokens', {
     },
     setSearch(value: string) { this.search = value; this.persist(); },
     setCategory(value: string) { this.category = value; this.persist(); },
-    acceptChange(id: string) {
+    /** 提交提案：快照生成在此发起，冻结发起版本、作用主题与基线值。 */
+    submitChange(input: { title: string; requester: string; scope?: string; impact?: number; token: string; theme: string; after: string }) {
+      const token = this.tokens.find((item) => item.id === input.token);
+      if (!token) return undefined;
+      const snapshot = snapshotProposal(this.tokens, { token: input.token, theme: input.theme }, this.releaseVersion);
+      const seq = 500 + this.changes.length + 1;
+      const change: ChangeRequest = {
+        id: `CR-${seq}`,
+        title: input.title || `${token.name} 值调整`,
+        requester: input.requester || '设计系统维护员',
+        scope: input.scope ?? `${token.usage} 处引用`,
+        impact: input.impact ?? 30,
+        status: '待评审',
+        diff: { token: input.token, before: snapshot.baseValue, after: input.after },
+        baseVersion: snapshot.baseVersion,
+        theme: snapshot.theme,
+        baseValue: snapshot.baseValue,
+        mergeState: 'pending',
+        createdAt: Date.now()
+      };
+      this.changes.unshift(change);
+      this.persist();
+      return change;
+    },
+    /**
+     * 接受提案：以发起基线为共同祖先做三方合并，只写入作用主题。
+     * 当前版本已被别的提案改过或被旧页面直接写入且目标冲突时，
+     * 双方修改都保留并标记 conflict，绝不悄悄覆盖。
+     */
+    acceptChange(id: string): MergeVerdict | undefined {
       const change = this.changes.find((item) => item.id === id);
-      if (!change) return;
+      if (!change || change.status !== '待评审') return undefined;
       const token = this.tokens.find((item) => item.id === change.diff.token);
-      if (token) this.updateTokenValue(token.id, change.diff.after);
+      if (!token) return undefined;
+      const verdict = classifyMerge({
+        base: change.baseValue,
+        current: token.themes[change.theme] ?? '',
+        proposed: change.diff.after
+      });
       change.status = '已接受';
+      if (verdict.kind === 'clean') {
+        token.themes[change.theme] = verdict.value;
+        change.mergeState = 'clean';
+      } else if (verdict.kind === 'already') {
+        change.mergeState = 'already';
+      } else {
+        // 冲突：保留当前草稿（对方修改）与提案目标，等待人工裁决。
+        change.mergeState = 'conflict';
+        change.conflict = { base: verdict.base, current: verdict.current, proposed: verdict.proposed };
+      }
+      this.persist();
+      return verdict;
+    },
+    /** 冲突裁决：采用当前草稿（对方修改）或提案目标，只更新作用主题。 */
+    resolveConflict(id: string, choice: 'current' | 'proposed') {
+      const change = this.changes.find((item) => item.id === id);
+      if (!change || change.mergeState !== 'conflict' || !change.conflict) return;
+      const token = this.tokens.find((item) => item.id === change.diff.token);
+      if (!token) return;
+      const chosen = choice === 'proposed' ? change.conflict.proposed : change.conflict.current;
+      token.themes[change.theme] = chosen;
+      change.mergeState = 'resolved';
+      if (choice === 'proposed') change.diff.after = chosen;
+      change.conflict = undefined;
       this.persist();
     },
     rejectChange(id: string) {
@@ -160,19 +288,35 @@ export const useTokenStore = defineStore('tokens', {
     rollback() {
       this.baseline.forEach((base) => {
         const token = this.tokens.find((item) => item.id === base.id);
-        if (token) token.value = base.value;
+        if (token) {
+          token.value = base.value;
+          this.themes.forEach((theme) => {
+            if (base.themes[theme] !== undefined) token.themes[theme] = base.themes[theme];
+          });
+        }
       });
       this.persist();
     },
-    lockRelease() {
-      if (this.cycleNodes.length === 0 && this.invalidReferences.length === 0 && this.contrastIssues.length === 0 && this.changes.every((item) => item.status !== '待评审')) {
+    /** 发布：快照生成冻结只读版本；仍有未裁决冲突时拒绝发布。 */
+    lockRelease(version: string): { ok: boolean; error?: string; snapshot?: ReleaseSnapshot } {
+      if (this.cycleNodes.length === 0 && this.invalidReferences.length === 0 && this.contrastIssues.length === 0 && !this.changes.some((item) => item.status === '待评审') && !this.hasPendingConflicts) {
+        const baseVersion = this.lastPublished.replace(/^DS\s*/, '');
+        const result = buildReleaseSnapshot(this.tokens, this.changes, { version, baseVersion, themes: this.themes });
+        if ('error' in result) return { ok: false, error: result.error };
+        this.releaseSnapshots.unshift(result);
         this.locked = true;
-        this.lastPublished = `DS ${this.releaseVersion}`;
+        this.lastPublished = `DS ${version}`;
+        this.persist();
+        return { ok: true, snapshot: result };
       }
+      const gateError = this.hasPendingConflicts
+        ? `仍有 ${this.pendingConflictCount} 个冲突提案待裁决`
+        : '校验未全部通过或仍有提案待评审';
       this.persist();
+      return { ok: false, error: gateError };
     },
     persist() {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, locked: this.locked, lastPublished: this.lastPublished }));
+      if (typeof localStorage !== 'undefined') localStorage.setItem(storageKey, JSON.stringify({ tokens: this.tokens, changes: this.changes, activeTheme: this.activeTheme, selectedTokenId: this.selectedTokenId, search: this.search, category: this.category, releaseVersion: this.releaseVersion, locked: this.locked, lastPublished: this.lastPublished, baseline: this.baseline, releaseSnapshots: this.releaseSnapshots }));
     }
   }
 });
